@@ -74,6 +74,17 @@ import { initNudge, checkAndShowNudge } from './signup-nudge.js';
 import { initStarNudge, checkAndShowStarNudge } from './star-nudge.js';
 import { handleEstimateRequest, checkEstimateRateLimit, purgeExpiredRateLimitEntries, type EstimateRateLimitEntry } from './estimate.js';
 import { sendPing } from './telemetryPinger.js';
+import { ProviderRegistry } from './provider-registry.js';
+import { validateCustomProviders } from './config-validator.js';
+import { buildAuthHeaders } from './auth-resolver.js';
+import { CircuitBreaker } from './circuit-breaker.js';
+import {
+  detectRequestFormat,
+  convertRequestBody,
+  convertResponseBody,
+  type ApiFormat,
+  type ConversionContext,
+} from './format-converter.js';
 
 // Per-IP rate limit state for /v1/estimate (60 req/min per IP)
 const estimateRateMap = new Map<string, EstimateRateLimitEntry>();
@@ -97,6 +108,12 @@ const PROXY_VERSION: string = (() => {
     return '0.0.0';
   }
 })();
+
+/** Global Provider Registry instance — initialized at startup in startProxy() */
+export const providerRegistry = new ProviderRegistry();
+
+/** Circuit breakers for custom providers, keyed by provider name */
+export const customProviderCircuitBreakers = new Map<string, CircuitBreaker>();
 
 /** Returns true when the model is a Haiku variant (does not support extended thinking) */
 function isHaikuModel(model: string): boolean {
@@ -458,6 +475,8 @@ export function getAvailableModelNames(): string[] {
     ...Object.keys(MODEL_MAPPING),
     ...Object.keys(SMART_ALIASES),
     ...Object.keys(RELAYPLANE_ALIASES),
+    // Include models registered via custom providers in the Provider Registry
+    ...providerRegistry.getModelNames(),
     // Add common model prefixes users might type
     'relayplane:auto',
     'relayplane:cost',
@@ -840,6 +859,12 @@ interface RelayPlaneProxyConfigFile {
      */
     proceduralInjectionEnabled?: boolean;
   };
+  /**
+   * Custom provider definitions loaded by the Provider Registry.
+   * Each entry defines a new LLM provider endpoint with its API compatibility type,
+   * authentication, and model mappings.
+   */
+  customProviders?: unknown[];
   [key: string]: unknown;
 }
 
@@ -2764,6 +2789,20 @@ export function resolveExplicitModel(
     return SMART_ALIASES[resolvedAlias];
   }
 
+  // Check Provider Registry (custom providers + built-in model routes)
+  // Custom provider model definitions take priority over static MODEL_MAPPING
+  const registryRoute = providerRegistry.resolveModel(resolvedAlias);
+  if (registryRoute) {
+    return { provider: registryRoute.provider as Provider, model: registryRoute.remoteModel };
+  }
+  // Also try original name if alias was resolved
+  if (resolvedAlias !== modelName) {
+    const registryRouteOriginal = providerRegistry.resolveModel(modelName);
+    if (registryRouteOriginal) {
+      return { provider: registryRouteOriginal.provider as Provider, model: registryRouteOriginal.remoteModel };
+    }
+  }
+
   // Check MODEL_MAPPING (aliases)
   if (MODEL_MAPPING[resolvedAlias]) {
     return MODEL_MAPPING[resolvedAlias];
@@ -3064,6 +3103,27 @@ function resolveProviderApiKey(
   // Ollama doesn't need an API key — it's local
   if (provider === 'ollama') {
     return { apiKey: 'ollama-local' };
+  }
+
+  // Check if this is a custom provider registered in the Provider Registry
+  const registryProvider = providerRegistry.getProvider(provider as string);
+  if (registryProvider && registryProvider.isCustom) {
+    if (registryProvider.apiKey) {
+      return { apiKey: registryProvider.apiKey };
+    }
+    // Custom provider has no API key configured
+    return {
+      error: {
+        status: 401,
+        payload: {
+          error: {
+            type: 'provider_configuration_error',
+            message: `Custom provider '${provider}' has no API key configured. Set the ${registryProvider.apiKeyEnvVar} environment variable or add apiKeyValue to the provider config.`,
+            provider: provider as string,
+          },
+        },
+      },
+    };
   }
 
   const apiKeyEnv = DEFAULT_ENDPOINTS[provider]?.apiKeyEnv ?? `${provider.toUpperCase()}_API_KEY`;
@@ -3814,6 +3874,66 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }).catch(() => {
       console.warn('[RelayPlane] ⚠️  Ollama health check failed — will fall back to cloud providers');
     });
+  }
+
+  // === Provider Registry: load custom providers from config ===
+  {
+    const builtInNames = Object.keys(DEFAULT_ENDPOINTS);
+    const rawCustomProviders = proxyConfig.customProviders;
+
+    if (Array.isArray(rawCustomProviders) && rawCustomProviders.length > 0) {
+      // Validate custom provider configurations
+      const validationResult = validateCustomProviders(rawCustomProviders, builtInNames);
+
+      // Log validation errors
+      for (const err of validationResult.errors) {
+        console.error(`[RelayPlane] Custom provider config error (${err.provider}): ${err.field} — ${err.message}`);
+      }
+
+      // Log validation warnings
+      for (const warn of validationResult.warnings) {
+        console.warn(`[RelayPlane] Custom provider warning (${warn.provider}): ${warn.message}`);
+      }
+
+      // Load valid providers into the registry
+      providerRegistry.load(validationResult.valid);
+
+      // Req 4.6: Log total custom providers loaded at startup
+      const customCount = validationResult.valid.filter(p => !builtInNames.includes(p.name)).length;
+      console.log(`[RelayPlane] Custom providers loaded: ${customCount}`);
+
+      // Req 7.3: Log provider list in verbose mode
+      if (verbose) {
+        for (const provider of validationResult.valid) {
+          log(`Custom provider: ${provider.name} → ${provider.baseUrl} (${provider.apiCompatibility})`);
+        }
+      }
+    } else {
+      // No custom providers — load registry with built-in providers only
+      providerRegistry.load([]);
+    }
+  }
+
+  // === Custom Provider Circuit Breakers & Cooldown Registration (Task 5.2) ===
+  {
+    // Create a CircuitBreaker instance per custom provider
+    customProviderCircuitBreakers.clear();
+    const allProviders = providerRegistry.getProviderNames();
+    for (const name of allProviders) {
+      const provider = providerRegistry.getProvider(name);
+      if (provider && provider.isCustom) {
+        customProviderCircuitBreakers.set(name, new CircuitBreaker({
+          failureThreshold: 3,
+          resetTimeoutMs: 30_000,
+        }));
+        // Custom providers are automatically tracked by the CooldownManager
+        // when recordFailure/recordSuccess are called during request handling.
+        // No pre-registration needed — isAvailable() returns true for unknown providers.
+        if (verbose) {
+          log(`Circuit breaker created for custom provider: ${name}`);
+        }
+      }
+    }
   }
 
   // === Startup config validation (Task 4) ===
@@ -4889,6 +5009,101 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       } catch {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({}));
+      }
+      return;
+    }
+
+    // === Admin: Hot-reload custom providers (Req 8.1, 8.2, 8.3, 8.4) ===
+    if (req.method === 'POST' && pathname === '/v1/admin/reload-providers') {
+      try {
+        // Re-read config file
+        const reloadConfigPath = getProxyConfigPath();
+        let rawConfig: RelayPlaneProxyConfigFile;
+        try {
+          const raw = await fs.promises.readFile(reloadConfigPath, 'utf8');
+          rawConfig = JSON.parse(raw) as RelayPlaneProxyConfigFile;
+        } catch (readErr: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            added: [],
+            removed: [],
+            unchanged: providerRegistry.getProviderNames(),
+            errors: [`Failed to read config file: ${readErr.message}`],
+          }));
+          return;
+        }
+
+        const builtInNames = Object.keys(DEFAULT_ENDPOINTS);
+        const rawCustomProviders = rawConfig.customProviders;
+
+        // If no customProviders section or empty, treat as empty array
+        const providersToValidate = Array.isArray(rawCustomProviders) ? rawCustomProviders : [];
+
+        // Validate the new custom providers
+        const validationResult = validateCustomProviders(providersToValidate, builtInNames);
+
+        // If there are validation errors and NO valid providers, return 400 and preserve current state
+        if (validationResult.errors.length > 0 && validationResult.valid.length === 0) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            added: [],
+            removed: [],
+            unchanged: providerRegistry.getProviderNames(),
+            errors: validationResult.errors.map(e => `${e.provider}: ${e.field} — ${e.message}`),
+          }));
+          return;
+        }
+
+        // Snapshot removed providers before reload for in-flight tracking
+        const previousProviderNames = new Set(providerRegistry.getProviderNames());
+
+        // Reload the registry with the new valid providers (computes diff)
+        const reloadResult = providerRegistry.reload(validationResult.valid);
+
+        // Append validation errors to the reload result
+        const errorMessages = validationResult.errors.map(e => `${e.provider}: ${e.field} — ${e.message}`);
+        reloadResult.errors.push(...errorMessages);
+
+        // Handle removed providers: check for in-flight requests
+        for (const removedName of reloadResult.removed) {
+          if (providerRegistry.hasInFlightRequests(removedName)) {
+            console.log(`[RelayPlane] Provider '${removedName}' removed but has in-flight requests — allowing completion`);
+          }
+        }
+
+        // Update circuit breakers: remove for removed providers, add for new ones
+        for (const removedName of reloadResult.removed) {
+          customProviderCircuitBreakers.delete(removedName);
+        }
+        for (const addedName of reloadResult.added) {
+          const provider = providerRegistry.getProvider(addedName);
+          if (provider && provider.isCustom) {
+            customProviderCircuitBreakers.set(addedName, new CircuitBreaker({
+              failureThreshold: 3,
+              resetTimeoutMs: 30_000,
+            }));
+          }
+        }
+
+        // Log warnings
+        for (const warn of validationResult.warnings) {
+          console.warn(`[RelayPlane] Reload warning (${warn.provider}): ${warn.message}`);
+        }
+
+        console.log(`[RelayPlane] Providers reloaded: +${reloadResult.added.length} added, -${reloadResult.removed.length} removed, ${reloadResult.unchanged.length} unchanged`);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          added: reloadResult.added,
+          removed: reloadResult.removed,
+          unchanged: reloadResult.unchanged,
+          errors: reloadResult.errors,
+        }));
+      } catch (err: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: `Reload failed: ${err.message}`,
+        }));
       }
       return;
     }
@@ -7074,6 +7289,317 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 }
 
 /**
+ * Estimate cost for a custom provider request using the provider's configured rates.
+ * Falls back to the standard estimateCost() if the provider has no custom rates (both zero).
+ *
+ * @param providerName - The custom provider name
+ * @param inputTokens - Number of input tokens
+ * @param outputTokens - Number of output tokens
+ * @returns Estimated cost in USD
+ */
+export function estimateCustomProviderCost(
+  providerName: string,
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  const provider = providerRegistry.getProvider(providerName);
+  if (!provider || (provider.costPer1kInput === 0 && provider.costPer1kOutput === 0)) {
+    // No custom rates configured — return 0 (unknown cost)
+    return 0;
+  }
+  return (inputTokens / 1000) * provider.costPer1kInput + (outputTokens / 1000) * provider.costPer1kOutput;
+}
+
+/**
+ * Forward a non-streaming request to a custom provider using the Provider Registry.
+ * Handles format conversion (OpenAI ↔ Anthropic), auth header resolution,
+ * circuit breaker checks, cost recording, and in-flight request tracking.
+ */
+async function forwardToCustomProvider(
+  request: ChatRequest,
+  targetModel: string,
+  providerName: string,
+  incomingPath: string,
+): Promise<{ responseData: Record<string, unknown>; ok: boolean; status: number }> {
+  const resolvedProvider = providerRegistry.getProvider(providerName);
+  if (!resolvedProvider) {
+    return {
+      responseData: { error: `Provider '${providerName}' not found in registry` },
+      ok: false,
+      status: 500,
+    };
+  }
+
+  // Check for missing API key at request time (Req 1.3, 4.5)
+  if (!resolvedProvider.apiKey) {
+    return {
+      responseData: {
+        error: {
+          type: 'provider_configuration_error',
+          message: `Custom provider '${providerName}' has no API key configured. Set the ${resolvedProvider.apiKeyEnvVar} environment variable or add apiKeyValue to the provider config.`,
+          provider: providerName,
+        },
+      },
+      ok: false,
+      status: 401,
+    };
+  }
+
+  // Circuit breaker check: reject immediately if circuit is OPEN
+  const circuitBreaker = customProviderCircuitBreakers.get(providerName);
+  if (circuitBreaker && !circuitBreaker.isHealthy()) {
+    return {
+      responseData: { error: `Custom provider '${providerName}' circuit breaker is OPEN — provider temporarily unavailable` },
+      ok: false,
+      status: 503,
+    };
+  }
+
+  // Track in-flight request start
+  providerRegistry.trackRequestStart(providerName);
+
+  // Detect incoming request format from the path
+  const sourceFormat: ApiFormat = detectRequestFormat(incomingPath);
+  const targetFormat: ApiFormat = resolvedProvider.apiCompatibility;
+
+  // Build the request body
+  const requestBody: Record<string, unknown> = {
+    model: targetModel,
+    messages: request.messages,
+    stream: false,
+  };
+  if (request.temperature !== undefined) requestBody['temperature'] = request.temperature;
+  if (request.max_tokens !== undefined) requestBody['max_tokens'] = request.max_tokens;
+  if (request.tools) requestBody['tools'] = request.tools;
+  if (request.tool_choice) requestBody['tool_choice'] = request.tool_choice;
+
+  // Convert request body if formats differ
+  const conversionContext: ConversionContext = {
+    sourceFormat,
+    targetFormat,
+    targetModel,
+    stream: false,
+  };
+
+  let convertedBody: Record<string, unknown>;
+  try {
+    convertedBody = convertRequestBody(requestBody, conversionContext);
+  } catch (conversionErr) {
+    providerRegistry.trackRequestEnd(providerName);
+    return {
+      responseData: {
+        error: {
+          type: 'format_conversion_error',
+          message: `Failed to convert request body from ${sourceFormat} to ${targetFormat} format for provider '${providerName}': ${conversionErr instanceof Error ? conversionErr.message : String(conversionErr)}`,
+          provider: providerName,
+        },
+      },
+      ok: false,
+      status: 500,
+    };
+  }
+
+  // Build auth headers using the auth resolver
+  const authHeaders = buildAuthHeaders(resolvedProvider);
+
+  // Determine the endpoint URL
+  const baseUrl = resolvedProvider.baseUrl.replace(/\/+$/, '');
+  const endpoint = targetFormat === 'anthropic'
+    ? `${baseUrl}/messages`
+    : `${baseUrl}/chat/completions`;
+
+  // Make the request
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...authHeaders,
+  };
+
+  // Add anthropic-version header for Anthropic-compatible providers
+  if (targetFormat === 'anthropic') {
+    headers['anthropic-version'] = '2023-06-01';
+  }
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(convertedBody),
+    });
+
+    const responseData = (await response.json()) as Record<string, unknown>;
+
+    if (!response.ok) {
+      // Record circuit breaker failure
+      circuitBreaker?.recordFailure();
+      providerRegistry.trackRequestEnd(providerName);
+      return { responseData, ok: false, status: response.status };
+    }
+
+    // Record circuit breaker success
+    circuitBreaker?.recordSuccess();
+    providerRegistry.trackRequestEnd(providerName);
+
+    // Convert response body back to source format if needed
+    let convertedResponse: Record<string, unknown>;
+    try {
+      convertedResponse = convertResponseBody(responseData, conversionContext);
+    } catch (conversionErr) {
+      providerRegistry.trackRequestEnd(providerName);
+      return {
+        responseData: {
+          error: {
+            type: 'format_conversion_error',
+            message: `Failed to convert response body from ${targetFormat} to ${sourceFormat} format for provider '${providerName}': ${conversionErr instanceof Error ? conversionErr.message : String(conversionErr)}`,
+            provider: providerName,
+          },
+        },
+        ok: false,
+        status: 500,
+      };
+    }
+    return { responseData: convertedResponse, ok: true, status: 200 };
+  } catch (err) {
+    // Record circuit breaker failure on network errors
+    circuitBreaker?.recordFailure();
+    providerRegistry.trackRequestEnd(providerName);
+    return {
+      responseData: { error: `Failed to reach custom provider '${providerName}': ${err}` },
+      ok: false,
+      status: 502,
+    };
+  }
+}
+
+/**
+ * Forward a streaming request to a custom provider using the Provider Registry.
+ * Handles format conversion (OpenAI ↔ Anthropic), auth header resolution,
+ * circuit breaker checks, and in-flight request tracking.
+ * Returns the raw Response for streaming consumption.
+ */
+async function forwardToCustomProviderStream(
+  request: ChatRequest,
+  targetModel: string,
+  providerName: string,
+  incomingPath: string,
+): Promise<Response> {
+  const resolvedProvider = providerRegistry.getProvider(providerName);
+  if (!resolvedProvider) {
+    throw new Error(`Provider '${providerName}' not found in registry`);
+  }
+
+  // Check for missing API key at request time (Req 1.3, 4.5)
+  if (!resolvedProvider.apiKey) {
+    const errorBody = JSON.stringify({
+      error: {
+        type: 'provider_configuration_error',
+        message: `Custom provider '${providerName}' has no API key configured. Set the ${resolvedProvider.apiKeyEnvVar} environment variable or add apiKeyValue to the provider config.`,
+        provider: providerName,
+      },
+    });
+    return new Response(errorBody, {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Circuit breaker check: reject immediately if circuit is OPEN
+  const circuitBreaker = customProviderCircuitBreakers.get(providerName);
+  if (circuitBreaker && !circuitBreaker.isHealthy()) {
+    throw new Error(`Custom provider '${providerName}' circuit breaker is OPEN — provider temporarily unavailable`);
+  }
+
+  // Track in-flight request start
+  providerRegistry.trackRequestStart(providerName);
+
+  // Detect incoming request format from the path
+  const sourceFormat: ApiFormat = detectRequestFormat(incomingPath);
+  const targetFormat: ApiFormat = resolvedProvider.apiCompatibility;
+
+  // Build the request body
+  const requestBody: Record<string, unknown> = {
+    model: targetModel,
+    messages: request.messages,
+    stream: true,
+  };
+  if (request.temperature !== undefined) requestBody['temperature'] = request.temperature;
+  if (request.max_tokens !== undefined) requestBody['max_tokens'] = request.max_tokens;
+  if (request.tools) requestBody['tools'] = request.tools;
+  if (request.tool_choice) requestBody['tool_choice'] = request.tool_choice;
+
+  // Convert request body if formats differ
+  const conversionContext: ConversionContext = {
+    sourceFormat,
+    targetFormat,
+    targetModel,
+    stream: true,
+  };
+
+  let convertedBody: Record<string, unknown>;
+  try {
+    convertedBody = convertRequestBody(requestBody, conversionContext);
+  } catch (conversionErr) {
+    providerRegistry.trackRequestEnd(providerName);
+    const errorBody = JSON.stringify({
+      error: {
+        type: 'format_conversion_error',
+        message: `Failed to convert request body from ${sourceFormat} to ${targetFormat} format for provider '${providerName}': ${conversionErr instanceof Error ? conversionErr.message : String(conversionErr)}`,
+        provider: providerName,
+      },
+    });
+    return new Response(errorBody, {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Build auth headers using the auth resolver
+  const authHeaders = buildAuthHeaders(resolvedProvider);
+
+  // Determine the endpoint URL
+  const baseUrl = resolvedProvider.baseUrl.replace(/\/+$/, '');
+  const endpoint = targetFormat === 'anthropic'
+    ? `${baseUrl}/messages`
+    : `${baseUrl}/chat/completions`;
+
+  // Make the request
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...authHeaders,
+  };
+
+  // Add anthropic-version header for Anthropic-compatible providers
+  if (targetFormat === 'anthropic') {
+    headers['anthropic-version'] = '2023-06-01';
+  }
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(convertedBody),
+    });
+
+    if (!response.ok) {
+      // Record circuit breaker failure for non-OK responses
+      circuitBreaker?.recordFailure();
+      providerRegistry.trackRequestEnd(providerName);
+    } else {
+      // Record circuit breaker success
+      circuitBreaker?.recordSuccess();
+      // Note: trackRequestEnd for streaming is called after the stream completes
+      // in the caller's streaming handler. We only end tracking here for errors.
+    }
+
+    return response;
+  } catch (err) {
+    // Record circuit breaker failure on network errors
+    circuitBreaker?.recordFailure();
+    providerRegistry.trackRequestEnd(providerName);
+    throw err;
+  }
+}
+
+/**
  * Handle streaming request
  */
 async function executeNonStreamingProviderRequest(
@@ -7140,6 +7666,17 @@ async function executeNonStreamingProviderRequest(
       break;
     }
     default: {
+      // Check if this is a custom provider registered in the Provider Registry
+      const customProvider = providerRegistry.getProvider(targetProvider as string);
+      if (customProvider && customProvider.isCustom) {
+        const result = await forwardToCustomProvider(
+          request,
+          targetModel,
+          targetProvider as string,
+          '/v1/chat/completions', // Default to OpenAI format for chat/completions endpoint
+        );
+        return result;
+      }
       providerResponse = await forwardToOpenAI(request, targetModel, apiKey!);
       responseData = (await providerResponse.json()) as Record<string, unknown>;
       if (!providerResponse.ok) {
@@ -7231,8 +7768,20 @@ async function handleStreamingRequest(
         res.end();
         return;
       }
-      default:
-        providerResponse = await forwardToOpenAIStream(request, targetModel, apiKey!);
+      default: {
+        // Check if this is a custom provider registered in the Provider Registry
+        const customProvider = providerRegistry.getProvider(targetProvider as string);
+        if (customProvider && customProvider.isCustom) {
+          providerResponse = await forwardToCustomProviderStream(
+            request,
+            targetModel,
+            targetProvider as string,
+            '/v1/chat/completions', // Default to OpenAI format for chat/completions endpoint
+          );
+        } else {
+          providerResponse = await forwardToOpenAIStream(request, targetModel, apiKey!);
+        }
+      }
     }
 
     if (!providerResponse.ok) {
@@ -7366,7 +7915,13 @@ async function handleStreamingRequest(
       model: targetModel,
       tokensIn: streamTokensIn,
       tokensOut: streamTokensOut,
-      costUsd: estimateCost(targetModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined),
+      costUsd: (() => {
+        const cacheProvider = providerRegistry.getProvider(targetProvider);
+        if (cacheProvider?.isCustom && (cacheProvider.costPer1kInput > 0 || cacheProvider.costPer1kOutput > 0)) {
+          return estimateCustomProviderCost(targetProvider, streamTokensIn, streamTokensOut);
+        }
+        return estimateCost(targetModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined);
+      })(),
       taskType,
     });
     log(`Cache STORE (stream) for chat/completions ${targetModel} (hash: ${cacheHash.slice(0, 8)})`);
@@ -7374,6 +7929,12 @@ async function handleStreamingRequest(
 
   if (cooldownsEnabled) {
     cooldownManager.recordSuccess(targetProvider);
+  }
+
+  // End in-flight tracking for custom providers after streaming completes
+  const streamEndProvider = providerRegistry.getProvider(targetProvider);
+  if (streamEndProvider?.isCustom) {
+    providerRegistry.trackRequestEnd(targetProvider);
   }
 
   const durationMs = Date.now() - startTime;
@@ -7387,10 +7948,15 @@ async function handleStreamingRequest(
     true,
     routingMode,
     undefined,
-    taskType, complexity
+    taskType, complexity,
+    agentFingerprint, agentId
   );
   // Update token/cost info on the history entry (with cache token discount)
-  const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined);
+  // Use custom provider cost rates if available, otherwise fall back to standard estimateCost
+  const streamCustomProvider = providerRegistry.getProvider(targetProvider);
+  const streamCost = (streamCustomProvider?.isCustom && (streamCustomProvider.costPer1kInput > 0 || streamCustomProvider.costPer1kOutput > 0))
+    ? estimateCustomProviderCost(targetProvider, streamTokensIn, streamTokensOut)
+    : estimateCost(targetModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined);
   updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost, undefined, streamCacheCreation || undefined, streamCacheRead || undefined, agentFingerprint, agentId);
   if (agentFingerprint && agentFingerprint !== 'unknown') updateAgentCost(agentFingerprint, streamCost);
   if (sessionId && sessionSource) upsertSession(sessionId, sessionSource, streamCost, streamTokensIn, streamTokensOut);
@@ -7580,14 +8146,18 @@ async function handleNonStreamingRequest(
   const nonStreamRespModel = checkResponseModelMismatch(responseData, targetModel, targetProvider, log);
 
   // Log the successful request
-  logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, undefined, taskType, complexity);
+  logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, undefined, taskType, complexity, agentFingerprint, agentId);
   // Update token/cost info (including Anthropic prompt cache tokens)
   const usage = (responseData as any)?.usage;
   const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
   const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
   const cacheCreationTokens = usage?.cache_creation_input_tokens ?? 0;
   const cacheReadTokens = usage?.cache_read_input_tokens ?? 0;
-  const cost = estimateCost(targetModel, tokensIn, tokensOut, cacheCreationTokens || undefined, cacheReadTokens || undefined);
+  // Use custom provider cost rates if available, otherwise fall back to standard estimateCost
+  const customProviderForCost = providerRegistry.getProvider(targetProvider);
+  const cost = (customProviderForCost?.isCustom && (customProviderForCost.costPer1kInput > 0 || customProviderForCost.costPer1kOutput > 0))
+    ? estimateCustomProviderCost(targetProvider, tokensIn, tokensOut)
+    : estimateCost(targetModel, tokensIn, tokensOut, cacheCreationTokens || undefined, cacheReadTokens || undefined);
   updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel, cacheCreationTokens || undefined, cacheReadTokens || undefined, agentFingerprint, agentId);
   if (agentFingerprint && agentFingerprint !== 'unknown') updateAgentCost(agentFingerprint, cost);
   if (sessionId && sessionSource) upsertSession(sessionId, sessionSource, cost, tokensIn, tokensOut);

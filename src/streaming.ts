@@ -2,12 +2,20 @@
  * Streaming Support for RelayPlane Proxy
  *
  * Provides SSE (Server-Sent Events) streaming for LLM responses
- * and real-time updates.
+ * and real-time updates. Includes custom provider streaming with
+ * format-aware passthrough and cross-format conversion.
  *
  * @packageDocumentation
  */
 
 import type { ServerResponse } from 'node:http';
+import {
+  convertStreamChunk,
+  createStreamConversionState,
+  type ApiFormat,
+  type ConversionContext,
+  type StreamConversionState,
+} from './format-converter.js';
 
 /**
  * SSE message structure
@@ -328,4 +336,171 @@ export function startKeepAlive(
   }, intervalMs);
 
   return () => clearInterval(timer);
+}
+
+
+// ─── Custom Provider Streaming ───────────────────────────────────────────────
+
+/**
+ * Options for streaming a custom provider response.
+ */
+export interface CustomProviderStreamOptions {
+  /** The raw Response from the custom provider (must have a readable body) */
+  response: Response;
+  /** The format the provider returns (based on its apiCompatibility) */
+  providerFormat: ApiFormat;
+  /** The format the client expects (based on the incoming request path) */
+  clientFormat: ApiFormat;
+  /** The target model name (used in conversion context) */
+  targetModel: string;
+  /** Optional callback invoked for each raw SSE chunk string written to the client */
+  onChunk?: (chunk: string) => void;
+}
+
+/**
+ * Stream a custom provider response to the client, handling format differences.
+ *
+ * Behavior:
+ * - If providerFormat === clientFormat: passthrough (pipe raw bytes directly)
+ * - If formats differ: parse each SSE chunk and convert via convertStreamChunk()
+ *
+ * This function reads the response body as a stream and writes converted SSE
+ * chunks to the ServerResponse without buffering the entire response.
+ *
+ * @returns An async generator yielding SSE chunk strings for the client.
+ */
+export async function* streamCustomProviderResponse(
+  options: CustomProviderStreamOptions
+): AsyncGenerator<string, void, unknown> {
+  const { response, providerFormat, clientFormat, targetModel, onChunk } = options;
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error('Custom provider response has no readable body');
+  }
+
+  const decoder = new TextDecoder();
+  const needsConversion = providerFormat !== clientFormat;
+
+  if (!needsConversion) {
+    // ─── Passthrough: pipe raw bytes directly ─────────────────────────────
+    // Both OpenAI (`data: {...}\n\n`) and Anthropic (`event: ...\ndata: {...}\n\n`)
+    // are forwarded as-is since client and provider share the same format.
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        onChunk?.(text);
+        yield text;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return;
+  }
+
+  // ─── Cross-format conversion: parse SSE events and convert each chunk ──
+  const conversionContext: ConversionContext = {
+    sourceFormat: clientFormat,
+    targetFormat: providerFormat,
+    targetModel,
+    stream: true,
+  };
+  const state: StreamConversionState = createStreamConversionState();
+
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // Process complete SSE events from the buffer.
+      // SSE events are delimited by double newlines (\n\n).
+      // We split on \n\n to extract complete events.
+      const events = buffer.split('\n\n');
+      // The last element may be an incomplete event; keep it in the buffer
+      buffer = events.pop() ?? '';
+
+      for (const rawEvent of events) {
+        const trimmed = rawEvent.trim();
+        if (!trimmed) continue;
+
+        // Reconstruct the full SSE chunk with the trailing \n\n delimiter
+        const fullChunk = trimmed + '\n\n';
+
+        // Convert the chunk using the format converter
+        const converted = convertStreamChunk(fullChunk, conversionContext, state);
+
+        if (converted !== null) {
+          onChunk?.(converted);
+          yield converted;
+        }
+      }
+    }
+
+    // Process any remaining data in the buffer
+    if (buffer.trim()) {
+      const fullChunk = buffer.trim() + '\n\n';
+      const converted = convertStreamChunk(fullChunk, conversionContext, state);
+      if (converted !== null) {
+        onChunk?.(converted);
+        yield converted;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Pipe a custom provider streaming response directly to a ServerResponse.
+ *
+ * This is a convenience function that wraps `streamCustomProviderResponse`
+ * and writes each chunk to the HTTP response. It sets appropriate SSE headers
+ * and handles the full lifecycle.
+ *
+ * @param res - The Node.js ServerResponse to write to
+ * @param options - Streaming options (response, formats, model)
+ * @param extraHeaders - Additional headers to include in the response (e.g., relay metadata)
+ * @returns Object with streaming metadata (chunks written, success status)
+ */
+export async function pipeCustomProviderStream(
+  res: ServerResponse,
+  options: CustomProviderStreamOptions,
+  extraHeaders?: Record<string, string>
+): Promise<{ success: boolean; chunksWritten: number }> {
+  // Write SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    ...extraHeaders,
+  });
+
+  let chunksWritten = 0;
+
+  try {
+    for await (const chunk of streamCustomProviderResponse(options)) {
+      const writeOk = res.write(chunk);
+      chunksWritten++;
+
+      // If write returns false, the buffer is full; wait for drain
+      if (!writeOk) {
+        await new Promise<void>((resolve) => res.once('drain', resolve));
+      }
+    }
+
+    res.end();
+    return { success: true, chunksWritten };
+  } catch (error) {
+    // If the response hasn't been ended yet, try to end it gracefully
+    if (!res.writableEnded) {
+      res.end();
+    }
+    return { success: false, chunksWritten };
+  }
 }

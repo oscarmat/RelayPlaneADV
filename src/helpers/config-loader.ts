@@ -15,6 +15,7 @@ export interface RelayPlaneProxyConfigFile {
       models?: string[];
     };
   };
+  customProviders?: unknown[];
 }
 
 export function getProxyConfig(): RelayPlaneProxyConfigFile {

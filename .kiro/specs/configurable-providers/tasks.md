@@ -2,7 +2,7 @@
 
 ## Overview
 
-This plan implements a dynamic Provider Registry for RelayPlane proxy that loads custom LLM provider definitions from `~/.relayplane/config.json`. The implementation is broken into incremental steps: core interfaces and validation, model routing, format conversion, auth resolution, integration with existing systems, streaming support, hot-reload, and CLI/documentation updates.
+This plan implements a dynamic Provider Registry for RelayPlane proxy that loads custom LLM provider definitions from `~/.relayplane/config.json`. The implementation is broken into incremental steps: core interfaces and validation, model routing, format conversion, auth resolution, integration with existing systems, streaming support, hot-reload, and CLI/documentation updates. All code is TypeScript, tested with Vitest and `fast-check` for property-based tests.
 
 ## Tasks
 
@@ -16,25 +16,28 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
     - Implement `trackRequestStart()`, `trackRequestEnd()`, `hasInFlightRequests()` for in-flight tracking
     - _Requirements: 1.1, 1.5, 2.1, 2.2, 2.3, 2.4, 2.5_
 
-  - [ ] 1.2 Create `src/config-validator.ts` with validation logic
+  - [ ] 1.2 Create `src/config-validator.ts` with validation logic for custom providers
     - Implement `validateCustomProviders()` function returning `ValidationResult`
     - Validate required fields: `name`, `baseUrl`, `apiCompatibility`, `apiKeyEnvVar`
     - Validate `baseUrl` is a parseable URL via `new URL()`
     - Validate `apiCompatibility` is `'openai'` or `'anthropic'`
     - Generate warnings for name conflicts with built-in providers
     - Generate warnings for missing API key (env var not set, no `apiKeyValue`)
+    - Log total number of valid custom providers loaded
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6_
 
-  - [ ]* 1.3 Write property tests for ProviderRegistry loading (Properties 1, 5, 6, 7, 8)
+  - [ ]* 1.3 Write property tests for ProviderRegistry loading
     - **Property 1: Provider loading completeness** — For any valid array of custom provider configs, every provider is retrievable by name after loading
     - **Property 5: Custom provider overrides built-in** — Custom provider with same name as built-in returns custom config
     - **Property 6: Model entry resolution** — String entries resolve as `{ provider, remoteModel: s }`, object entries resolve as `{ provider, remoteModel: r }`
     - **Property 7: Custom model overrides built-in mapping** — Custom model definitions take priority over MODEL_MAPPING
     - **Property 8: Prefix-based routing** — Models starting with prefix route to provider; others do not
+    - Test file: `__tests__/provider-registry.property.test.ts`
     - **Validates: Requirements 1.1, 1.5, 2.1, 2.2, 2.3, 2.4, 2.5**
 
-  - [ ]* 1.4 Write property tests for ConfigValidator (Property 2)
+  - [ ]* 1.4 Write property tests for ConfigValidator
     - **Property 2: Validation rejects invalid configurations** — Configs missing required fields or with invalid values are excluded from valid results with corresponding error entries
+    - Test file: `__tests__/config-validator.property.test.ts`
     - **Validates: Requirements 1.2, 4.2, 4.3, 4.4**
 
 - [ ] 2. Checkpoint - Ensure all tests pass
@@ -47,7 +50,8 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
     - Default to `Authorization: Bearer <key>` for openai compatibility
     - Default to `x-api-key: <key>` for anthropic compatibility
     - Merge with provider's custom `headers` map
-    - _Requirements: 3.5, 3.6, 3.7, 1.4_
+    - Resolve API key from `apiKeyValue` first, then fall back to `apiKeyEnvVar`
+    - _Requirements: 1.3, 1.4, 3.5, 3.6, 3.7_
 
   - [ ] 3.2 Create `src/format-converter.ts` with bidirectional format conversion
     - Extract existing OpenAI↔Anthropic conversion logic from `standalone-proxy.ts` into reusable module
@@ -58,22 +62,26 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
     - Handle passthrough when source and target formats match (no conversion)
     - _Requirements: 3.1, 3.2, 3.3, 3.4_
 
-  - [ ]* 3.3 Write property tests for AuthResolver (Property 12)
+  - [ ]* 3.3 Write property tests for AuthResolver
     - **Property 12: Auth header matches provider configuration** — Outgoing auth header uses `authHeader` if defined, else `Authorization` for openai, else `x-api-key` for anthropic
+    - Test file: `__tests__/auth-resolver.property.test.ts`
     - **Validates: Requirements 3.5, 3.6, 3.7**
 
-  - [ ]* 3.4 Write property tests for FormatConverter (Properties 9, 10, 11)
+  - [ ]* 3.4 Write property tests for FormatConverter
     - **Property 9: Format passthrough when compatible** — No conversion applied when request format matches provider apiCompatibility
     - **Property 10: OpenAI-to-Anthropic conversion produces valid structure** — Converted body has `messages` array (no system role), `model`, `max_tokens`, and optional `system` field
     - **Property 11: Anthropic-to-OpenAI conversion produces valid structure** — Converted body has `messages` array with system as role, and `model` field
+    - Test file: `__tests__/format-converter.property.test.ts`
     - **Validates: Requirements 3.1, 3.2, 3.3, 3.4**
 
-  - [ ]* 3.5 Write property test for API key resolution priority (Property 3)
+  - [ ]* 3.5 Write property test for API key resolution priority
     - **Property 3: API key resolution priority** — When both `apiKeyEnvVar` and `apiKeyValue` are defined, resolved key equals `apiKeyValue`
+    - Test file: `__tests__/api-key-resolution.property.test.ts`
     - **Validates: Requirements 1.3**
 
-  - [ ]* 3.6 Write property test for custom headers inclusion (Property 4)
+  - [ ]* 3.6 Write property test for custom headers inclusion
     - **Property 4: Custom headers inclusion** — All entries in provider's `headers` map are present in outgoing request headers
+    - Test file: `__tests__/custom-headers.property.test.ts`
     - **Validates: Requirements 1.4**
 
 - [ ] 4. Checkpoint - Ensure all tests pass
@@ -99,8 +107,9 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
     - Include provider name in agent tracking, routing logs, and telemetry
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
 
-  - [ ]* 5.3 Write property test for cost calculation (Property 13)
+  - [ ]* 5.3 Write property test for cost calculation
     - **Property 13: Cost calculation with custom rates** — Estimated cost equals `(inputTokens / 1000) * costPer1kInput + (outputTokens / 1000) * costPer1kOutput`
+    - Test file: `__tests__/cost-calculation.property.test.ts`
     - **Validates: Requirements 5.3**
 
   - [ ]* 5.4 Write unit tests for proxy integration
@@ -138,8 +147,9 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
     - Return 400 with validation errors if new config is invalid (preserve current state)
     - _Requirements: 8.1, 8.2, 8.3, 8.4_
 
-  - [ ]* 8.2 Write property test for reload diff correctness (Property 14)
+  - [ ]* 8.2 Write property test for reload diff correctness
     - **Property 14: Reload diff correctness** — `added` lists names in after but not before, `removed` lists names in before but not after, `unchanged` lists names in both
+    - Test file: `__tests__/reload-diff.property.test.ts`
     - **Validates: Requirements 8.1, 8.4**
 
   - [ ]* 8.3 Write integration tests for hot-reload
@@ -152,8 +162,8 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 10. Update CLI and documentation
-  - [ ] 10.1 Update `relayplane init` to include commented-out `customProviders` example
-    - Modify the init command in `src/cli.ts` to include a commented example in generated config
+  - [ ] 10.1 Update `relayplane init` in `src/cli.ts` to include commented-out `customProviders` example
+    - Modify the init command to include a commented example in generated config
     - Example should show one OpenAI-compatible and one Anthropic-compatible provider
     - _Requirements: 7.2_
 
@@ -162,6 +172,11 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
     - Include guidance on setting the environment variable or adding `apiKeyValue`
     - Handle format conversion failures with 500 and error details
     - _Requirements: 1.3, 4.5_
+
+  - [ ] 10.3 Update README documentation with `customProviders` configuration example
+    - Add a section showing at least one OpenAI-compatible and one Anthropic-compatible provider example
+    - Document all available fields and their behavior
+    - _Requirements: 7.1_
 
 - [ ] 11. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
@@ -174,7 +189,9 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
 - Property tests validate universal correctness properties from the design document using `fast-check` with Vitest
 - Unit tests validate specific examples and edge cases
 - The implementation uses TypeScript throughout, matching the existing codebase
-- `fast-check` must be added as a devDependency for property-based testing
+- `fast-check` is already a devDependency in `package.json`
+- Existing test files use `__tests__/*.property.test.ts` naming convention for property tests
+- Several source files already exist (`src/provider-registry.ts`, `src/config-validator.ts`, `src/auth-resolver.ts`, `src/format-converter.ts`) — tasks may involve modifying rather than creating from scratch
 
 ## Task Dependency Graph
 
@@ -188,7 +205,7 @@ This plan implements a dynamic Provider Registry for RelayPlane proxy that loads
     { "id": 4, "tasks": ["5.2", "7.1"] },
     { "id": 5, "tasks": ["5.3", "5.4", "7.2"] },
     { "id": 6, "tasks": ["8.1"] },
-    { "id": 7, "tasks": ["8.2", "8.3", "10.1", "10.2"] }
+    { "id": 7, "tasks": ["8.2", "8.3", "10.1", "10.2", "10.3"] }
   ]
 }
 ```

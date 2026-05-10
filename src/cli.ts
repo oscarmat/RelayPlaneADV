@@ -2044,6 +2044,39 @@ async function handleInitWizard(): Promise<void> {
   budget['onBreach'] = onBreach;
   rawConfig['budget'] = budget;
 
+  // Include customProviders (empty by default) with a commented-out example
+  // showing one OpenAI-compatible and one Anthropic-compatible provider.
+  if (!rawConfig['customProviders']) {
+    rawConfig['customProviders'] = [];
+  }
+  if (!rawConfig['_customProvidersExample']) {
+    rawConfig['_customProvidersExample'] = [
+      {
+        _comment: 'OpenAI-compatible provider example. Rename _customProvidersExample to customProviders to activate.',
+        name: 'my-openai-provider',
+        baseUrl: 'https://api.example.com/v1',
+        apiCompatibility: 'openai',
+        apiKeyEnvVar: 'MY_OPENAI_PROVIDER_KEY',
+        models: [
+          'my-model-small',
+          { name: 'my-model-large', remoteModel: 'gpt-4-turbo' },
+        ],
+        costPer1kInput: 0.005,
+        costPer1kOutput: 0.015,
+      },
+      {
+        _comment: 'Anthropic-compatible provider example.',
+        name: 'my-anthropic-provider',
+        baseUrl: 'https://api.my-anthropic-proxy.com/v1',
+        apiCompatibility: 'anthropic',
+        apiKeyEnvVar: 'MY_ANTHROPIC_PROVIDER_KEY',
+        headers: { 'X-Custom-Header': 'value' },
+        models: ['my-claude-model'],
+        modelPrefix: 'myanthro/',
+      },
+    ];
+  }
+
   // Atomic write
   if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
   writeFileSync(configPath + '.tmp', JSON.stringify(rawConfig, null, 2) + '\n');
