@@ -5645,9 +5645,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           res.end(JSON.stringify(buildModelNotFoundError(requestedModel, getAvailableModelNames())));
           return;
         }
-        if (resolved.provider !== 'anthropic') {
+        // Allow custom providers — the proxy handles format conversion
+        const resolvedPInfo = providerRegistry.getProvider(resolved.provider);
+        if (resolved.provider !== 'anthropic' && !resolvedPInfo) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Native /v1/messages only supports Anthropic models.' }));
+          res.end(JSON.stringify({ error: 'Native /v1/messages only supports Anthropic models or custom providers.' }));
           return;
         }
         targetProvider = resolved.provider;
@@ -5691,7 +5693,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
 
         const resolved = resolveConfigModel(selectedModel);
-        if (!resolved || resolved.provider !== 'anthropic') {
+        if (!resolved) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Failed to resolve routing model' }));
+          return;
+        }
+        // Allow custom providers — the proxy handles format conversion (Anthropic ↔ OpenAI)
+        const resolvedProviderInfo = providerRegistry.getProvider(resolved.provider);
+        if (!resolvedProviderInfo && resolved.provider !== 'anthropic') {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Resolved model is not supported for /v1/messages' }));
           return;
@@ -5918,8 +5927,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               if (!resolved) {
                 throw new Error(`Invalid cascade model: ${modelName}`);
               }
-              if (resolved.provider !== 'anthropic') {
-                throw new Error(`Cascade model ${modelName} is not Anthropic-compatible`);
+              if (resolved.provider !== 'anthropic' && !providerRegistry.getProvider(resolved.provider)) {
+                throw new Error(`Cascade model ${modelName} is not Anthropic-compatible or a custom provider`);
               }
               if (proxyConfig.reliability?.cooldowns?.enabled && !cooldownManager.isAvailable(resolved.provider)) {
                 throw new CooldownError(resolved.provider);
@@ -5974,6 +5983,72 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           targetProvider = cascadeResult.provider;
           targetModel = cascadeResult.model;
         } else {
+          // Check if this is a custom provider — route through forwardToCustomProvider
+          const customProviderInfo = providerRegistry.getProvider(targetProvider);
+          if (customProviderInfo && customProviderInfo.isCustom) {
+            const finalModel = targetModel || requestedModel;
+            log(`Custom provider dispatch: ${targetProvider}/${finalModel} via /v1/messages`);
+
+            if (isStreaming) {
+              try {
+                const streamResponse = await forwardToCustomProviderStream(
+                  request as ChatRequest,
+                  finalModel,
+                  targetProvider,
+                  '/v1/messages',
+                );
+                if (!streamResponse.ok) {
+                  const errorData = await streamResponse.text();
+                  res.writeHead(streamResponse.status, { 'Content-Type': 'application/json' });
+                  res.end(errorData);
+                } else {
+                  const { pipeCustomProviderStream } = await import('./streaming.js');
+                  const rpHeaders = buildRelayPlaneResponseHeaders(
+                    finalModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
+                  );
+                  await pipeCustomProviderStream(res, {
+                    response: streamResponse,
+                    providerFormat: customProviderInfo.apiCompatibility,
+                    clientFormat: 'anthropic',
+                    targetModel: finalModel,
+                  }, rpHeaders);
+                  providerRegistry.trackRequestEnd(targetProvider);
+                }
+              } catch (err) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `Custom provider streaming failed: ${err}` }));
+              }
+            } else {
+              const result = await forwardToCustomProvider(
+                request as ChatRequest,
+                finalModel,
+                targetProvider,
+                '/v1/messages',
+              );
+              const rpHeaders = buildRelayPlaneResponseHeaders(
+                finalModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
+              );
+              res.writeHead(result.status, { 'Content-Type': 'application/json', ...rpHeaders });
+              res.end(JSON.stringify(result.responseData));
+            }
+
+            // Log the request
+            const endTime = Date.now();
+            logRequest({
+              timestamp: new Date().toISOString(),
+              model: finalModel,
+              originalModel: originalModel ?? requestedModel,
+              provider: targetProvider,
+              taskType,
+              complexity,
+              latencyMs: endTime - startTime,
+              success: true,
+              routingMode,
+              cached: false,
+            });
+            return;
+          }
+
           // Hybrid auth: use MAX token for Opus models, API key for others
           const finalModel = targetModel || requestedModel;
           const modelAuth = getAuthForModel(finalModel, proxyConfig.auth, useAnthropicEnvKey);
