@@ -5668,12 +5668,13 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             const complexityVal = proxyConfig.routing?.complexity?.[complexity];
             if (complexityVal != null) {
               const parsed = parseComplexityModel(complexityVal);
-              selectedModel = `${parsed.provider}/${parsed.model}`;
+              targetProvider = parsed.provider;
+              targetModel = parsed.model;
               log(`Complexity routing: ${complexity} → ${parsed.provider}/${parsed.model}`);
             }
           }
           // Fall back to learned routing rules (non-default only)
-          if (!selectedModel) {
+          if (!targetModel) {
             const rule = relay.routing.get(taskType);
             const parsedRule = rule?.preferredModel ? parsePreferredModel(rule.preferredModel) : null;
             if (parsedRule?.provider === 'anthropic' && rule?.source !== 'default') {
@@ -5681,32 +5682,34 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             }
           }
           // Final fallback to DEFAULT_ROUTING
-          if (!selectedModel) {
+          if (!selectedModel && !targetModel) {
             selectedModel = DEFAULT_ROUTING[taskType].model;
           }
         }
 
-        if (!selectedModel) {
+        if (!selectedModel && !targetModel) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Failed to resolve routing model' }));
           return;
         }
 
-        const resolved = resolveConfigModel(selectedModel);
-        if (!resolved) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Failed to resolve routing model' }));
-          return;
+        if (selectedModel && !targetModel) {
+          const resolved = resolveConfigModel(selectedModel);
+          if (!resolved) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Failed to resolve routing model' }));
+            return;
+          }
+          // Allow custom providers — the proxy handles format conversion (Anthropic ↔ OpenAI)
+          const resolvedProviderInfo = providerRegistry.getProvider(resolved.provider);
+          if (!resolvedProviderInfo && resolved.provider !== 'anthropic') {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Resolved model is not supported for /v1/messages' }));
+            return;
+          }
+          targetProvider = resolved.provider;
+          targetModel = resolved.model;
         }
-        // Allow custom providers — the proxy handles format conversion (Anthropic ↔ OpenAI)
-        const resolvedProviderInfo = providerRegistry.getProvider(resolved.provider);
-        if (!resolvedProviderInfo && resolved.provider !== 'anthropic') {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Resolved model is not supported for /v1/messages' }));
-          return;
-        }
-        targetProvider = resolved.provider;
-        targetModel = resolved.model;
       }
 
       // Guard: Sonnet has a 200K standard context window. Requests larger than that
