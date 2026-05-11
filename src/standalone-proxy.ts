@@ -579,8 +579,14 @@ function parseComplexityModel(
       const provider = rawProvider as Provider;
       return { provider, model };
     }
-    // Plain model name — look up in MODEL_MAPPING, fallback to anthropic
-    return MODEL_MAPPING[val] ?? { provider: 'anthropic' as Provider, model: val };
+    // Plain model name — look up in MODEL_MAPPING, then providerRegistry, fallback to anthropic
+    const builtIn = MODEL_MAPPING[val];
+    if (builtIn) return builtIn;
+    const registryRoute = providerRegistry.resolveModel(val);
+    if (registryRoute) {
+      return { provider: registryRoute.provider as Provider, model: registryRoute.remoteModel };
+    }
+    return { provider: 'anthropic' as Provider, model: val };
   }
   return { provider: 'anthropic' as Provider, model: 'claude-sonnet-4-6' };
 }
