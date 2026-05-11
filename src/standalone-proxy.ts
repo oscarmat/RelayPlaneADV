@@ -5989,10 +5989,21 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             const finalModel = targetModel || requestedModel;
             log(`Custom provider dispatch: ${targetProvider}/${finalModel} via /v1/messages`);
 
+            // Build a ChatRequest from requestBody
+            const chatReq: ChatRequest = {
+              model: finalModel,
+              messages: requestBody['messages'] as any[] ?? [],
+              max_tokens: requestBody['max_tokens'] as number | undefined,
+              temperature: requestBody['temperature'] as number | undefined,
+              stream: isStreaming,
+              tools: requestBody['tools'] as any[] | undefined,
+              tool_choice: requestBody['tool_choice'] as any,
+            };
+
             if (isStreaming) {
               try {
                 const streamResponse = await forwardToCustomProviderStream(
-                  request as ChatRequest,
+                  chatReq,
                   finalModel,
                   targetProvider,
                   '/v1/messages',
@@ -6020,7 +6031,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               }
             } else {
               const result = await forwardToCustomProvider(
-                request as ChatRequest,
+                chatReq,
                 finalModel,
                 targetProvider,
                 '/v1/messages',
@@ -6034,18 +6045,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
             // Log the request
             const endTime = Date.now();
-            logRequest({
-              timestamp: new Date().toISOString(),
-              model: finalModel,
-              originalModel: originalModel ?? requestedModel,
-              provider: targetProvider,
+            logRequest(
+              originalModel ?? requestedModel,
+              finalModel,
+              targetProvider as Provider,
+              endTime - startTime,
+              true,
+              routingMode,
+              false,
               taskType,
               complexity,
-              latencyMs: endTime - startTime,
-              success: true,
-              routingMode,
-              cached: false,
-            });
+            );
             return;
           }
 
