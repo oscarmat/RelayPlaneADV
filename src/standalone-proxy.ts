@@ -7499,7 +7499,7 @@ async function forwardToCustomProvider(
   // Determine the endpoint URL
   // Custom providers use baseUrl as-is (the user specifies the full endpoint URL).
   // No path suffix is appended — the user knows their provider's exact endpoint.
-  const endpoint = resolvedProvider.baseUrl.replace(/\/+$/, '');
+  const endpoint = resolvedProvider.baseUrl;
 
   // Make the request
   const headers: Record<string, string> = {
@@ -7650,7 +7650,7 @@ async function forwardToCustomProviderStream(
 
   // Determine the endpoint URL
   // Custom providers use baseUrl as-is (the user specifies the full endpoint URL).
-  const endpoint = resolvedProvider.baseUrl.replace(/\/+$/, '');
+  const endpoint = resolvedProvider.baseUrl;
 
   // Make the request
   const headers: Record<string, string> = {
