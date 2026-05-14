@@ -7497,9 +7497,10 @@ async function forwardToCustomProvider(
   const authHeaders = buildAuthHeaders(resolvedProvider);
 
   // Determine the endpoint URL
-  // Custom providers use baseUrl as-is (the user specifies the full endpoint URL).
-  // No path suffix is appended — the user knows their provider's exact endpoint.
-  const endpoint = resolvedProvider.baseUrl;
+  const baseUrl = resolvedProvider.baseUrl.replace(/\/+$/, '');
+  const endpoint = targetFormat === 'anthropic'
+    ? `${baseUrl}/messages`
+    : `${baseUrl}/chat/completions`;
 
   // Make the request
   const headers: Record<string, string> = {
@@ -7649,8 +7650,10 @@ async function forwardToCustomProviderStream(
   const authHeaders = buildAuthHeaders(resolvedProvider);
 
   // Determine the endpoint URL
-  // Custom providers use baseUrl as-is (the user specifies the full endpoint URL).
-  const endpoint = resolvedProvider.baseUrl;
+  const baseUrl = resolvedProvider.baseUrl.replace(/\/+$/, '');
+  const endpoint = targetFormat === 'anthropic'
+    ? `${baseUrl}/messages`
+    : `${baseUrl}/chat/completions`;
 
   // Make the request
   const headers: Record<string, string> = {
