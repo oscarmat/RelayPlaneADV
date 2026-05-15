@@ -161,10 +161,11 @@ export class TraceWriter {
 
   private constructor(config: TracesConfig) {
     this.config = config;
-    // Normalise ~ to home dir
-    this.baseDir = config.directory.startsWith('~')
+    // Normalise ~ to home dir and remove trailing slashes for consistent path checks
+    const rawDir = config.directory.startsWith('~')
       ? config.directory.replace(/^~/, os.homedir())
       : config.directory;
+    this.baseDir = rawDir.replace(/\/+$/, '');
 
     if (config.enabled) {
       try {
