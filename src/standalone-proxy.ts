@@ -6058,6 +6058,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               false,
               taskType,
               complexity,
+              chatAgentFingerprint,
+              chatExplicitAgentId,
             );
             return;
           }
