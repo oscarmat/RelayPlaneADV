@@ -525,9 +525,17 @@ export async function pipeCustomProviderStream(
         try {
           const parsed = JSON.parse(jsonStr);
 
-          // Anthropic format: content_block_delta with text
-          if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
-            responseText += parsed.delta.text;
+          // Anthropic format: content_block_delta with text or thinking
+          if (parsed.type === 'content_block_delta') {
+            if (parsed.delta?.type === 'text_delta' && parsed.delta?.text) {
+              responseText += parsed.delta.text;
+            } else if (parsed.delta?.text) {
+              responseText += parsed.delta.text;
+            }
+            // Also capture thinking content for response preview
+            if (parsed.delta?.type === 'thinking_delta' && parsed.delta?.thinking) {
+              responseText += parsed.delta.thinking;
+            }
           }
 
           // Anthropic format: message_delta with usage at end of stream
@@ -540,6 +548,7 @@ export async function pipeCustomProviderStream(
             inputTokens = parsed.message.usage.input_tokens ?? 0;
             cacheCreationTokens = parsed.message.usage.cache_creation_input_tokens;
             cacheReadTokens = parsed.message.usage.cache_read_input_tokens;
+            console.log(`[RelayPlane][DEBUG-TOKENS] message_start found: input_tokens=${inputTokens}`);
           }
 
           // OpenAI format: choices[0].delta.content
@@ -583,8 +592,15 @@ export async function pipeCustomProviderStream(
         if (!jsonStr || jsonStr === '[DONE]') continue;
         try {
           const parsed = JSON.parse(jsonStr);
-          if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
-            responseText += parsed.delta.text;
+          if (parsed.type === 'content_block_delta') {
+            if (parsed.delta?.type === 'text_delta' && parsed.delta?.text) {
+              responseText += parsed.delta.text;
+            } else if (parsed.delta?.text) {
+              responseText += parsed.delta.text;
+            }
+            if (parsed.delta?.type === 'thinking_delta' && parsed.delta?.thinking) {
+              responseText += parsed.delta.thinking;
+            }
           }
           if (parsed.type === 'message_delta' && parsed.usage) {
             outputTokens = parsed.usage.output_tokens ?? outputTokens;
