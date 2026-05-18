@@ -7742,6 +7742,8 @@ async function forwardToCustomProviderStream(
     headers['anthropic-version'] = '2023-06-01';
   }
 
+  console.log(`[RelayPlane][DEBUG-AUTH] forwardToCustomProviderStream: provider=${providerName}, hasKey=${!!resolvedProvider.apiKey}, keyPrefix=${resolvedProvider.apiKey?.slice(0, 10) ?? 'null'}, endpoint=${endpoint}, authHeaders=${JSON.stringify(authHeaders)}`);
+
   try {
     const response = await fetch(endpoint, {
       method: 'POST',
