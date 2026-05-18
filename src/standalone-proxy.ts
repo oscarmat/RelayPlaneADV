@@ -6010,10 +6010,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             let customProviderCacheRead: number | undefined;
 
             if (isStreaming) {
+              console.log(`[RelayPlane][DEBUG-MSG] /v1/messages streaming custom provider: ${targetProvider}/${finalModel}, compat: ${customProviderInfo.apiCompatibility}`);
               // Capture request content before streaming (response won't be available)
               if (isContentLoggingEnabled()) {
                 const extracted = extractRequestContent(requestBody, true);
                 customProviderContentData = { ...extracted };
+                console.log(`[RelayPlane][DEBUG-MSG] Content captured: systemPrompt=${!!extracted.systemPrompt}, userMsg=${!!extracted.userMessage}`);
               }
 
               try {
@@ -6023,6 +6025,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                   targetProvider,
                   '/v1/messages',
                 );
+                console.log(`[RelayPlane][DEBUG-MSG] Stream response status: ${streamResponse.status}, ok: ${streamResponse.ok}`);
                 if (!streamResponse.ok) {
                   const errorData = await streamResponse.text();
                   res.writeHead(streamResponse.status, { 'Content-Type': 'application/json' });
@@ -6045,6 +6048,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                   customProviderTokensOut = streamResult.outputTokens;
                   customProviderCacheCreation = streamResult.cacheCreationTokens;
                   customProviderCacheRead = streamResult.cacheReadTokens;
+                  console.log(`[RelayPlane][DEBUG-MSG] Stream complete: tokens in=${customProviderTokensIn} out=${customProviderTokensOut}, responseText length=${streamResult.responseText.length}`);
 
                   // Add response preview to content data
                   if (customProviderContentData && streamResult.responseText) {
