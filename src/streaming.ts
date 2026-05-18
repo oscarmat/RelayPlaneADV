@@ -497,50 +497,64 @@ export async function pipeCustomProviderStream(
   let cacheCreationTokens: number | undefined;
   let cacheReadTokens: number | undefined;
   let responseText = '';
+  let sseBuffer = '';
 
   // Wrap onChunk to also extract tokens and text from SSE events
   const originalOnChunk = options.onChunk;
   options.onChunk = (chunk: string) => {
     originalOnChunk?.(chunk);
 
-    // Parse SSE data lines to extract usage and content
-    const lines = chunk.split('\n');
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const jsonStr = line.slice(6).trim();
-      if (jsonStr === '[DONE]') continue;
-      try {
-        const parsed = JSON.parse(jsonStr);
+    // Buffer chunks and parse complete SSE events (delimited by \n\n)
+    sseBuffer += chunk;
+    const events = sseBuffer.split('\n\n');
+    // Keep the last incomplete fragment in the buffer
+    sseBuffer = events.pop() ?? '';
 
-        // Anthropic format: content_block_delta with text
-        if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
-          responseText += parsed.delta.text;
+    for (const event of events) {
+      const lines = event.split('\n');
+      for (const line of lines) {
+        // Handle both "data: {...}" and "data:{...}" formats
+        let jsonStr: string | null = null;
+        if (line.startsWith('data: ')) {
+          jsonStr = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+          jsonStr = line.slice(5).trim();
         }
+        if (!jsonStr || jsonStr === '[DONE]') continue;
 
-        // Anthropic format: message_delta with usage at end of stream
-        if (parsed.type === 'message_delta' && parsed.usage) {
-          outputTokens = parsed.usage.output_tokens ?? outputTokens;
-        }
+        try {
+          const parsed = JSON.parse(jsonStr);
 
-        // Anthropic format: message_start with usage (input tokens)
-        if (parsed.type === 'message_start' && parsed.message?.usage) {
-          inputTokens = parsed.message.usage.input_tokens ?? 0;
-          cacheCreationTokens = parsed.message.usage.cache_creation_input_tokens;
-          cacheReadTokens = parsed.message.usage.cache_read_input_tokens;
-        }
+          // Anthropic format: content_block_delta with text
+          if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+            responseText += parsed.delta.text;
+          }
 
-        // OpenAI format: choices[0].delta.content
-        if (parsed.choices?.[0]?.delta?.content) {
-          responseText += parsed.choices[0].delta.content;
-        }
+          // Anthropic format: message_delta with usage at end of stream
+          if (parsed.type === 'message_delta' && parsed.usage) {
+            outputTokens = parsed.usage.output_tokens ?? outputTokens;
+          }
 
-        // OpenAI format: usage in final chunk
-        if (parsed.usage && parsed.usage.prompt_tokens) {
-          inputTokens = parsed.usage.prompt_tokens ?? 0;
-          outputTokens = parsed.usage.completion_tokens ?? 0;
+          // Anthropic format: message_start with usage (input tokens)
+          if (parsed.type === 'message_start' && parsed.message?.usage) {
+            inputTokens = parsed.message.usage.input_tokens ?? 0;
+            cacheCreationTokens = parsed.message.usage.cache_creation_input_tokens;
+            cacheReadTokens = parsed.message.usage.cache_read_input_tokens;
+          }
+
+          // OpenAI format: choices[0].delta.content
+          if (parsed.choices?.[0]?.delta?.content) {
+            responseText += parsed.choices[0].delta.content;
+          }
+
+          // OpenAI format: usage in final chunk
+          if (parsed.usage && parsed.usage.prompt_tokens) {
+            inputTokens = parsed.usage.prompt_tokens ?? 0;
+            outputTokens = parsed.usage.completion_tokens ?? 0;
+          }
+        } catch {
+          // Not valid JSON, skip
         }
-      } catch {
-        // Not valid JSON, skip
       }
     }
   };
@@ -553,6 +567,41 @@ export async function pipeCustomProviderStream(
       // If write returns false, the buffer is full; wait for drain
       if (!writeOk) {
         await new Promise<void>((resolve) => res.once('drain', resolve));
+      }
+    }
+
+    // Process any remaining data in the SSE buffer (e.g., final usage event)
+    if (sseBuffer.trim()) {
+      const finalLines = sseBuffer.split('\n');
+      for (const line of finalLines) {
+        let jsonStr: string | null = null;
+        if (line.startsWith('data: ')) {
+          jsonStr = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+          jsonStr = line.slice(5).trim();
+        }
+        if (!jsonStr || jsonStr === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(jsonStr);
+          if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+            responseText += parsed.delta.text;
+          }
+          if (parsed.type === 'message_delta' && parsed.usage) {
+            outputTokens = parsed.usage.output_tokens ?? outputTokens;
+          }
+          if (parsed.type === 'message_start' && parsed.message?.usage) {
+            inputTokens = parsed.message.usage.input_tokens ?? 0;
+            cacheCreationTokens = parsed.message.usage.cache_creation_input_tokens;
+            cacheReadTokens = parsed.message.usage.cache_read_input_tokens;
+          }
+          if (parsed.choices?.[0]?.delta?.content) {
+            responseText += parsed.choices[0].delta.content;
+          }
+          if (parsed.usage && parsed.usage.prompt_tokens) {
+            inputTokens = parsed.usage.prompt_tokens ?? 0;
+            outputTokens = parsed.usage.completion_tokens ?? 0;
+          }
+        } catch { /* skip */ }
       }
     }
 
