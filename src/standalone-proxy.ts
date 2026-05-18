@@ -7938,6 +7938,7 @@ async function handleStreamingRequest(
         // Check if this is a custom provider registered in the Provider Registry
         const customProvider = providerRegistry.getProvider(targetProvider as string);
         if (customProvider && customProvider.isCustom) {
+          console.log(`[RelayPlane][DEBUG] Streaming custom provider: ${targetProvider}, apiCompatibility: ${customProvider.apiCompatibility}, model: ${targetModel}`);
           providerResponse = await forwardToCustomProviderStream(
             request,
             targetModel,
@@ -8050,9 +8051,12 @@ async function handleStreamingRequest(
         // Check if this is a custom provider with Anthropic compatibility
         const streamingCustomProvider = providerRegistry.getProvider(targetProvider as string);
         if (streamingCustomProvider?.isCustom && streamingCustomProvider.apiCompatibility === 'anthropic') {
+          console.log(`[RelayPlane][DEBUG] Streaming chunks: using convertAnthropicStream for custom provider ${targetProvider}`);
           // Custom provider returns Anthropic format — convert to OpenAI for the client
+          let chunkCount = 0;
           for await (const chunk of convertAnthropicStream(providerResponse, targetModel)) {
             res.write(chunk);
+            chunkCount++;
             if (shouldCacheStream) rawChunks.push(chunk);
             try {
               const lines = chunk.split('\n');
@@ -8064,12 +8068,15 @@ async function handleStreamingRequest(
                     streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
                     streamCacheCreation = evt.usage.cache_creation_tokens ?? streamCacheCreation;
                     streamCacheRead = evt.usage.cache_read_tokens ?? streamCacheRead;
+                    console.log(`[RelayPlane][DEBUG] Stream usage found: in=${streamTokensIn} out=${streamTokensOut} cacheCreate=${streamCacheCreation} cacheRead=${streamCacheRead}`);
                   }
                 }
               }
             } catch { /* skip parse errors */ }
           }
+          console.log(`[RelayPlane][DEBUG] Stream complete: ${chunkCount} chunks, tokens in=${streamTokensIn} out=${streamTokensOut}`);
         } else {
+          console.log(`[RelayPlane][DEBUG] Streaming chunks: using pipeOpenAIStream for provider ${targetProvider} (isCustom=${streamingCustomProvider?.isCustom}, compat=${streamingCustomProvider?.apiCompatibility})`);
           // xAI, OpenRouter, DeepSeek, Groq, OpenAI, and OpenAI-compatible custom providers
           for await (const chunk of pipeOpenAIStream(providerResponse)) {
             res.write(chunk);
