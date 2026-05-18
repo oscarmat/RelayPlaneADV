@@ -6004,6 +6004,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             };
 
             let customProviderContentData: RequestContentData | undefined;
+            let customProviderTokensIn = 0;
+            let customProviderTokensOut = 0;
+            let customProviderCacheCreation: number | undefined;
+            let customProviderCacheRead: number | undefined;
 
             if (isStreaming) {
               try {
@@ -6047,6 +6051,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               res.writeHead(result.status, { 'Content-Type': 'application/json', ...rpHeaders });
               res.end(JSON.stringify(result.responseData));
 
+              // Extract tokens from response (Anthropic format: usage.input_tokens/output_tokens)
+              if (result.ok && result.responseData) {
+                const usage = result.responseData['usage'] as { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined;
+                if (usage) {
+                  customProviderTokensIn = usage.input_tokens ?? 0;
+                  customProviderTokensOut = usage.output_tokens ?? 0;
+                  customProviderCacheCreation = usage.cache_creation_input_tokens;
+                  customProviderCacheRead = usage.cache_read_input_tokens;
+                }
+              }
+
               // Capture request content for dashboard if enabled (non-streaming only)
               if (isContentLoggingEnabled()) {
                 const extracted = extractRequestContent(requestBody, true);
@@ -6058,6 +6073,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 };
               }
             }
+
+            // Calculate cost
+            const customProviderCost = (customProviderTokensIn > 0 || customProviderTokensOut > 0)
+              ? estimateCustomProviderCost(targetProvider, customProviderTokensIn, customProviderTokensOut)
+              : 0;
 
             // Log the request
             const endTime = Date.now();
@@ -6075,10 +6095,24 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               nativeExplicitAgentId,
             );
 
-            // Update history entry with captured content
-            if (customProviderContentData) {
-              updateLastHistoryEntry(0, 0, 0, finalModel, undefined, undefined, nativeAgentFingerprint, nativeExplicitAgentId, customProviderContentData);
+            // Update history entry with tokens, cost, and content
+            updateLastHistoryEntry(
+              customProviderTokensIn,
+              customProviderTokensOut,
+              customProviderCost,
+              finalModel,
+              customProviderCacheCreation,
+              customProviderCacheRead,
+              nativeAgentFingerprint,
+              nativeExplicitAgentId,
+              customProviderContentData,
+            );
+
+            // Update agent cost tracking
+            if (nativeAgentFingerprint && nativeAgentFingerprint !== 'unknown' && customProviderCost > 0) {
+              updateAgentCost(nativeAgentFingerprint, customProviderCost);
             }
+
             return;
           }
 
