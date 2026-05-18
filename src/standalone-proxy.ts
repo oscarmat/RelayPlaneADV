@@ -6010,6 +6010,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             let customProviderCacheRead: number | undefined;
 
             if (isStreaming) {
+              // Capture request content before streaming (response won't be available)
+              if (isContentLoggingEnabled()) {
+                const extracted = extractRequestContent(requestBody, true);
+                customProviderContentData = { ...extracted };
+              }
+
               try {
                 const streamResponse = await forwardToCustomProviderStream(
                   chatReq,
