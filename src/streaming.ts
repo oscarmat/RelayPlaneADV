@@ -548,7 +548,6 @@ export async function pipeCustomProviderStream(
             inputTokens = parsed.message.usage.input_tokens ?? 0;
             cacheCreationTokens = parsed.message.usage.cache_creation_input_tokens;
             cacheReadTokens = parsed.message.usage.cache_read_input_tokens;
-            console.log(`[RelayPlane][DEBUG-TOKENS] message_start found: input_tokens=${inputTokens}`);
           }
 
           // OpenAI format: choices[0].delta.content
