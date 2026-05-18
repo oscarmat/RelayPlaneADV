@@ -6065,7 +6065,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               // Capture request content for dashboard if enabled (non-streaming only)
               if (isContentLoggingEnabled()) {
                 const extracted = extractRequestContent(requestBody, true);
-                const responseText = result.ok ? extractResponseText(result.responseData, resolvedPInfo?.apiCompatibility === 'anthropic') : undefined;
+                const responseText = result.ok ? extractResponseText(result.responseData, customProviderInfo.apiCompatibility === 'anthropic') : undefined;
                 customProviderContentData = {
                   ...extracted,
                   responsePreview: responseText ? responseText.slice(0, 500) : undefined,
