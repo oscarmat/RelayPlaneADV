@@ -6032,13 +6032,25 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                   const rpHeaders = buildRelayPlaneResponseHeaders(
                     finalModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
                   );
-                  await pipeCustomProviderStream(res, {
+                  const streamResult = await pipeCustomProviderStream(res, {
                     response: streamResponse,
                     providerFormat: customProviderInfo.apiCompatibility,
                     clientFormat: 'anthropic',
                     targetModel: finalModel,
                   }, rpHeaders);
                   providerRegistry.trackRequestEnd(targetProvider);
+
+                  // Extract tokens and response from stream result
+                  customProviderTokensIn = streamResult.inputTokens;
+                  customProviderTokensOut = streamResult.outputTokens;
+                  customProviderCacheCreation = streamResult.cacheCreationTokens;
+                  customProviderCacheRead = streamResult.cacheReadTokens;
+
+                  // Add response preview to content data
+                  if (customProviderContentData && streamResult.responseText) {
+                    customProviderContentData.responsePreview = streamResult.responseText.slice(0, 500);
+                    customProviderContentData.fullResponse = streamResult.responseText;
+                  }
                 }
               } catch (err) {
                 res.writeHead(502, { 'Content-Type': 'application/json' });

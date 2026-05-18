@@ -466,13 +466,23 @@ export async function* streamCustomProviderResponse(
  * @param res - The Node.js ServerResponse to write to
  * @param options - Streaming options (response, formats, model)
  * @param extraHeaders - Additional headers to include in the response (e.g., relay metadata)
- * @returns Object with streaming metadata (chunks written, success status)
+ * @returns Object with streaming metadata (chunks written, success status, tokens, response text)
  */
+export interface CustomProviderStreamResult {
+  success: boolean;
+  chunksWritten: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens?: number;
+  cacheReadTokens?: number;
+  responseText: string;
+}
+
 export async function pipeCustomProviderStream(
   res: ServerResponse,
   options: CustomProviderStreamOptions,
   extraHeaders?: Record<string, string>
-): Promise<{ success: boolean; chunksWritten: number }> {
+): Promise<CustomProviderStreamResult> {
   // Write SSE headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -482,6 +492,58 @@ export async function pipeCustomProviderStream(
   });
 
   let chunksWritten = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheCreationTokens: number | undefined;
+  let cacheReadTokens: number | undefined;
+  let responseText = '';
+
+  // Wrap onChunk to also extract tokens and text from SSE events
+  const originalOnChunk = options.onChunk;
+  options.onChunk = (chunk: string) => {
+    originalOnChunk?.(chunk);
+
+    // Parse SSE data lines to extract usage and content
+    const lines = chunk.split('\n');
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const jsonStr = line.slice(6).trim();
+      if (jsonStr === '[DONE]') continue;
+      try {
+        const parsed = JSON.parse(jsonStr);
+
+        // Anthropic format: content_block_delta with text
+        if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+          responseText += parsed.delta.text;
+        }
+
+        // Anthropic format: message_delta with usage at end of stream
+        if (parsed.type === 'message_delta' && parsed.usage) {
+          outputTokens = parsed.usage.output_tokens ?? outputTokens;
+        }
+
+        // Anthropic format: message_start with usage (input tokens)
+        if (parsed.type === 'message_start' && parsed.message?.usage) {
+          inputTokens = parsed.message.usage.input_tokens ?? 0;
+          cacheCreationTokens = parsed.message.usage.cache_creation_input_tokens;
+          cacheReadTokens = parsed.message.usage.cache_read_input_tokens;
+        }
+
+        // OpenAI format: choices[0].delta.content
+        if (parsed.choices?.[0]?.delta?.content) {
+          responseText += parsed.choices[0].delta.content;
+        }
+
+        // OpenAI format: usage in final chunk
+        if (parsed.usage && parsed.usage.prompt_tokens) {
+          inputTokens = parsed.usage.prompt_tokens ?? 0;
+          outputTokens = parsed.usage.completion_tokens ?? 0;
+        }
+      } catch {
+        // Not valid JSON, skip
+      }
+    }
+  };
 
   try {
     for await (const chunk of streamCustomProviderResponse(options)) {
@@ -495,12 +557,12 @@ export async function pipeCustomProviderStream(
     }
 
     res.end();
-    return { success: true, chunksWritten };
+    return { success: true, chunksWritten, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, responseText };
   } catch (error) {
     // If the response hasn't been ended yet, try to end it gracefully
     if (!res.writableEnded) {
       res.end();
     }
-    return { success: false, chunksWritten };
+    return { success: false, chunksWritten, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, responseText };
   }
 }
