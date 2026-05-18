@@ -8046,24 +8046,49 @@ async function handleStreamingRequest(
           } catch { /* skip parse errors */ }
         }
         break;
-      default:
-        // xAI, OpenRouter, DeepSeek, Groq, OpenAI all use OpenAI-compatible streaming format
-        for await (const chunk of pipeOpenAIStream(providerResponse)) {
-          res.write(chunk);
-          if (shouldCacheStream) rawChunks.push(chunk);
-          try {
-            const lines = chunk.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-                const evt = JSON.parse(line.slice(6));
-                if (evt.usage) {
-                  streamTokensIn = evt.usage.prompt_tokens ?? streamTokensIn;
-                  streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
+      default: {
+        // Check if this is a custom provider with Anthropic compatibility
+        const streamingCustomProvider = providerRegistry.getProvider(targetProvider as string);
+        if (streamingCustomProvider?.isCustom && streamingCustomProvider.apiCompatibility === 'anthropic') {
+          // Custom provider returns Anthropic format — convert to OpenAI for the client
+          for await (const chunk of convertAnthropicStream(providerResponse, targetModel)) {
+            res.write(chunk);
+            if (shouldCacheStream) rawChunks.push(chunk);
+            try {
+              const lines = chunk.split('\n');
+              for (const line of lines) {
+                if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                  const evt = JSON.parse(line.slice(6));
+                  if (evt.usage) {
+                    streamTokensIn = evt.usage.prompt_tokens ?? streamTokensIn;
+                    streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
+                    streamCacheCreation = evt.usage.cache_creation_tokens ?? streamCacheCreation;
+                    streamCacheRead = evt.usage.cache_read_tokens ?? streamCacheRead;
+                  }
                 }
               }
-            }
-          } catch { /* skip parse errors */ }
+            } catch { /* skip parse errors */ }
+          }
+        } else {
+          // xAI, OpenRouter, DeepSeek, Groq, OpenAI, and OpenAI-compatible custom providers
+          for await (const chunk of pipeOpenAIStream(providerResponse)) {
+            res.write(chunk);
+            if (shouldCacheStream) rawChunks.push(chunk);
+            try {
+              const lines = chunk.split('\n');
+              for (const line of lines) {
+                if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                  const evt = JSON.parse(line.slice(6));
+                  if (evt.usage) {
+                    streamTokensIn = evt.usage.prompt_tokens ?? streamTokensIn;
+                    streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
+                  }
+                }
+              }
+            } catch { /* skip parse errors */ }
+          }
         }
+      }
     }
   } catch (err) {
     log(`Streaming error: ${err}`);
