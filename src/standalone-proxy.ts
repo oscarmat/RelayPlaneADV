@@ -6003,6 +6003,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               tool_choice: requestBody['tool_choice'] as any,
             };
 
+            let customProviderContentData: RequestContentData | undefined;
+
             if (isStreaming) {
               try {
                 const streamResponse = await forwardToCustomProviderStream(
@@ -6044,6 +6046,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               );
               res.writeHead(result.status, { 'Content-Type': 'application/json', ...rpHeaders });
               res.end(JSON.stringify(result.responseData));
+
+              // Capture request content for dashboard if enabled (non-streaming only)
+              if (isContentLoggingEnabled()) {
+                const extracted = extractRequestContent(requestBody, true);
+                const responseText = result.ok ? extractResponseText(result.responseData, resolvedPInfo?.apiCompatibility === 'anthropic') : undefined;
+                customProviderContentData = {
+                  ...extracted,
+                  responsePreview: responseText ? responseText.slice(0, 500) : undefined,
+                  fullResponse: responseText || undefined,
+                };
+              }
             }
 
             // Log the request
@@ -6061,6 +6074,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               nativeAgentFingerprint,
               nativeExplicitAgentId,
             );
+
+            // Update history entry with captured content
+            if (customProviderContentData) {
+              updateLastHistoryEntry(0, 0, 0, finalModel, undefined, undefined, nativeAgentFingerprint, nativeExplicitAgentId, customProviderContentData);
+            }
             return;
           }
 
