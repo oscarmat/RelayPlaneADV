@@ -6666,18 +6666,63 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
     // === Model list endpoint ===
     if (req.method === 'GET' && url.includes('/models')) {
+      // Build model list with context window info from complexity routing config
+      const complexityConfig = proxyConfig.routing?.complexity;
+      const modelsInRotation: string[] = [];
+      if (complexityConfig?.enabled) {
+        if (complexityConfig.simple) modelsInRotation.push(typeof complexityConfig.simple === 'string' ? complexityConfig.simple : (complexityConfig.simple as any).model ?? '');
+        if (complexityConfig.moderate) modelsInRotation.push(typeof complexityConfig.moderate === 'string' ? complexityConfig.moderate : (complexityConfig.moderate as any).model ?? '');
+        if (complexityConfig.complex) modelsInRotation.push(typeof complexityConfig.complex === 'string' ? complexityConfig.complex : (complexityConfig.complex as any).model ?? '');
+      }
+
+      // Find minimum context window across all models in the routing pool
+      let minContextWindow = 0;
+      let minMaxOutput = 0;
+      for (const modelName of modelsInRotation) {
+        const route = providerRegistry.resolveModel(modelName);
+        if (route) {
+          const provider = providerRegistry.getProvider(route.provider);
+          if (provider && provider.contextWindow > 0) {
+            if (minContextWindow === 0 || provider.contextWindow < minContextWindow) {
+              minContextWindow = provider.contextWindow;
+            }
+          }
+          if (provider && provider.maxOutputTokens > 0) {
+            if (minMaxOutput === 0 || provider.maxOutputTokens < minMaxOutput) {
+              minMaxOutput = provider.maxOutputTokens;
+            }
+          }
+        }
+      }
+
+      const modelData = [
+        { id: 'relayplane:auto', object: 'model', owned_by: 'relayplane', ...(minContextWindow > 0 ? { context_window: minContextWindow } : {}), ...(minMaxOutput > 0 ? { max_output_tokens: minMaxOutput } : {}) },
+        { id: 'relayplane:cost', object: 'model', owned_by: 'relayplane', ...(minContextWindow > 0 ? { context_window: minContextWindow } : {}), ...(minMaxOutput > 0 ? { max_output_tokens: minMaxOutput } : {}) },
+        { id: 'relayplane:fast', object: 'model', owned_by: 'relayplane', ...(minContextWindow > 0 ? { context_window: minContextWindow } : {}), ...(minMaxOutput > 0 ? { max_output_tokens: minMaxOutput } : {}) },
+        { id: 'relayplane:quality', object: 'model', owned_by: 'relayplane', ...(minContextWindow > 0 ? { context_window: minContextWindow } : {}), ...(minMaxOutput > 0 ? { max_output_tokens: minMaxOutput } : {}) },
+      ];
+
+      // Also list custom provider models with their context windows
+      for (const providerName of providerRegistry.getProviderNames()) {
+        const prov = providerRegistry.getProvider(providerName);
+        if (prov?.isCustom && prov.contextWindow > 0) {
+          for (const modelName of providerRegistry.getModelNames()) {
+            const route = providerRegistry.resolveModel(modelName);
+            if (route?.provider === providerName) {
+              modelData.push({
+                id: modelName,
+                object: 'model',
+                owned_by: providerName,
+                context_window: prov.contextWindow,
+                ...(prov.maxOutputTokens > 0 ? { max_output_tokens: prov.maxOutputTokens } : {}),
+              });
+            }
+          }
+        }
+      }
+
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          object: 'list',
-          data: [
-            { id: 'relayplane:auto', object: 'model', owned_by: 'relayplane' },
-            { id: 'relayplane:cost', object: 'model', owned_by: 'relayplane' },
-            { id: 'relayplane:fast', object: 'model', owned_by: 'relayplane' },
-            { id: 'relayplane:quality', object: 'model', owned_by: 'relayplane' },
-          ],
-        })
-      );
+      res.end(JSON.stringify({ object: 'list', data: modelData }));
       return;
     }
 

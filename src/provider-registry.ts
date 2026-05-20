@@ -39,6 +39,10 @@ export interface CustomProviderConfig {
   costPer1kInput?: number;
   /** Cost per 1K output tokens (USD) */
   costPer1kOutput?: number;
+  /** Context window size in tokens (used in /v1/models response) */
+  contextWindow?: number;
+  /** Maximum output tokens (used in /v1/models response) */
+  maxOutputTokens?: number;
 }
 
 /**
@@ -55,6 +59,8 @@ export interface ResolvedProvider {
   authHeader: string;
   costPer1kInput: number;
   costPer1kOutput: number;
+  contextWindow: number;
+  maxOutputTokens: number;
   isCustom: boolean;
 }
 
@@ -144,6 +150,8 @@ export class ProviderRegistry {
         authHeader: defaultAuthHeader,
         costPer1kInput: 0,
         costPer1kOutput: 0,
+        contextWindow: 0,
+        maxOutputTokens: 0,
         isCustom: false,
       });
     }
@@ -181,6 +189,8 @@ export class ProviderRegistry {
         authHeader,
         costPer1kInput: config.costPer1kInput ?? 0,
         costPer1kOutput: config.costPer1kOutput ?? 0,
+        contextWindow: config.contextWindow ?? 0,
+        maxOutputTokens: config.maxOutputTokens ?? 0,
         isCustom: true,
       };
 
