@@ -3937,12 +3937,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               ? `${baseUrl.replace(/\/v1$/, '')}/v1/models`
               : `${baseUrl}/models`;
 
-            const authHeader = provConfig.apiCompatibility === 'anthropic'
+            const authHeader: Record<string, string> = provConfig.apiCompatibility === 'anthropic'
               ? { 'x-api-key': provConfig.apiKeyValue! }
               : { 'Authorization': `Bearer ${provConfig.apiKeyValue!}` };
 
             const resp = await fetch(modelsUrl, {
-              headers: { ...authHeader },
+              headers: authHeader,
               signal: AbortSignal.timeout(10000),
             });
 
