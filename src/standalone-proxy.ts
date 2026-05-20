@@ -74,7 +74,7 @@ import { initNudge, checkAndShowNudge } from './signup-nudge.js';
 import { initStarNudge, checkAndShowStarNudge } from './star-nudge.js';
 import { handleEstimateRequest, checkEstimateRateLimit, purgeExpiredRateLimitEntries, type EstimateRateLimitEntry } from './estimate.js';
 import { sendPing } from './telemetryPinger.js';
-import { ProviderRegistry } from './provider-registry.js';
+import { ProviderRegistry, type CustomProviderConfig } from './provider-registry.js';
 import { validateCustomProviders } from './config-validator.js';
 import { buildAuthHeaders } from './auth-resolver.js';
 import { CircuitBreaker } from './circuit-breaker.js';
@@ -3917,6 +3917,84 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     } else {
       // No custom providers — load registry with built-in providers only
       providerRegistry.load([]);
+    }
+  }
+
+  // === Auto-discover context window for custom providers (non-blocking) ===
+  {
+    const customProviderConfigs = Array.isArray(proxyConfig.customProviders) ? proxyConfig.customProviders as CustomProviderConfig[] : [];
+    const providersNeedingDiscovery = customProviderConfigs.filter(p => !p.contextWindow && p.apiKeyValue);
+
+    if (providersNeedingDiscovery.length > 0) {
+      // Fire-and-forget: discover context windows in background
+      (async () => {
+        let configUpdated = false;
+        for (const provConfig of providersNeedingDiscovery) {
+          try {
+            const baseUrl = provConfig.baseUrl.replace(/\/+$/, '');
+            // Try OpenAI-compatible /models endpoint first
+            const modelsUrl = provConfig.apiCompatibility === 'anthropic'
+              ? `${baseUrl.replace(/\/v1$/, '')}/v1/models`
+              : `${baseUrl}/models`;
+
+            const authHeader = provConfig.apiCompatibility === 'anthropic'
+              ? { 'x-api-key': provConfig.apiKeyValue! }
+              : { 'Authorization': `Bearer ${provConfig.apiKeyValue!}` };
+
+            const resp = await fetch(modelsUrl, {
+              headers: { ...authHeader },
+              signal: AbortSignal.timeout(10000),
+            });
+
+            if (resp.ok) {
+              const data = await resp.json() as { data?: Array<{ id?: string; context_length?: number; context_window?: number }> };
+              if (data.data && Array.isArray(data.data)) {
+                // Find the minimum context window across all models from this provider
+                let minContext = 0;
+                for (const model of data.data) {
+                  const ctx = model.context_length ?? model.context_window ?? 0;
+                  if (ctx > 0 && (minContext === 0 || ctx < minContext)) {
+                    minContext = ctx;
+                  }
+                }
+                if (minContext > 0) {
+                  provConfig.contextWindow = minContext;
+                  configUpdated = true;
+                  console.log(`[RelayPlane] Auto-discovered context window for ${provConfig.name}: ${minContext} tokens`);
+                  // Update the provider in the registry
+                  const resolved = providerRegistry.getProvider(provConfig.name);
+                  if (resolved) {
+                    resolved.contextWindow = minContext;
+                  }
+                }
+              }
+            }
+          } catch {
+            // Silent failure — provider may not support /models endpoint
+          }
+        }
+
+        // Persist discovered values to config file
+        if (configUpdated) {
+          try {
+            const configPath = getProxyConfigPath();
+            const raw = await fs.promises.readFile(configPath, 'utf8');
+            const config = JSON.parse(raw);
+            if (Array.isArray(config.customProviders)) {
+              for (const saved of config.customProviders as CustomProviderConfig[]) {
+                const discovered = customProviderConfigs.find(p => p.name === saved.name);
+                if (discovered?.contextWindow && !saved.contextWindow) {
+                  saved.contextWindow = discovered.contextWindow;
+                }
+              }
+              await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), 'utf8');
+              console.log(`[RelayPlane] Saved discovered context windows to config`);
+            }
+          } catch {
+            // Best effort — don't break startup
+          }
+        }
+      })();
     }
   }
 
