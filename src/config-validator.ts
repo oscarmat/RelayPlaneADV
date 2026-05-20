@@ -135,6 +135,12 @@ export function validateCustomProviders(
     if (typeof entry.costPer1kOutput === 'number') {
       validConfig.costPer1kOutput = entry.costPer1kOutput;
     }
+    if (typeof entry.contextWindow === 'number') {
+      validConfig.contextWindow = entry.contextWindow;
+    }
+    if (typeof entry.maxOutputTokens === 'number') {
+      validConfig.maxOutputTokens = entry.maxOutputTokens;
+    }
 
     // Generate warning for name conflicts with built-in providers
     if (builtInNames.includes(validConfig.name)) {
