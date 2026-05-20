@@ -6778,6 +6778,21 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
       }
 
+      // Fallback: if no context window found via model routes, check all custom providers directly
+      if (minContextWindow === 0) {
+        for (const providerName of providerRegistry.getProviderNames()) {
+          const prov = providerRegistry.getProvider(providerName);
+          if (prov?.isCustom && prov.contextWindow > 0) {
+            if (minContextWindow === 0 || prov.contextWindow < minContextWindow) {
+              minContextWindow = prov.contextWindow;
+            }
+            if (prov.maxOutputTokens > 0 && (minMaxOutput === 0 || prov.maxOutputTokens < minMaxOutput)) {
+              minMaxOutput = prov.maxOutputTokens;
+            }
+          }
+        }
+      }
+
       const modelData = [
         { id: 'relayplane:auto', object: 'model', owned_by: 'relayplane', ...(minContextWindow > 0 ? { context_window: minContextWindow } : {}), ...(minMaxOutput > 0 ? { max_output_tokens: minMaxOutput } : {}) },
         { id: 'relayplane:cost', object: 'model', owned_by: 'relayplane', ...(minContextWindow > 0 ? { context_window: minContextWindow } : {}), ...(minMaxOutput > 0 ? { max_output_tokens: minMaxOutput } : {}) },
