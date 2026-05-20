@@ -3923,7 +3923,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   // === Auto-discover context window for custom providers (non-blocking) ===
   {
     const customProviderConfigs = Array.isArray(proxyConfig.customProviders) ? proxyConfig.customProviders as CustomProviderConfig[] : [];
-    const providersNeedingDiscovery = customProviderConfigs.filter(p => !p.contextWindow && p.apiKeyValue);
+    const providersNeedingDiscovery = customProviderConfigs.filter(p => {
+      if (p.contextWindow) return false; // Already configured
+      const hasKey = p.apiKeyValue || (p.apiKeyEnvVar && process.env[p.apiKeyEnvVar]);
+      return !!hasKey;
+    });
 
     if (providersNeedingDiscovery.length > 0) {
       // Fire-and-forget: discover context windows in background
@@ -3937,9 +3941,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               ? `${baseUrl.replace(/\/v1$/, '')}/v1/models`
               : `${baseUrl}/models`;
 
+            const apiKey = provConfig.apiKeyValue ?? process.env[provConfig.apiKeyEnvVar] ?? '';
             const authHeader: Record<string, string> = provConfig.apiCompatibility === 'anthropic'
-              ? { 'x-api-key': provConfig.apiKeyValue! }
-              : { 'Authorization': `Bearer ${provConfig.apiKeyValue!}` };
+              ? { 'x-api-key': apiKey }
+              : { 'Authorization': `Bearer ${apiKey}` };
 
             const resp = await fetch(modelsUrl, {
               headers: authHeader,
