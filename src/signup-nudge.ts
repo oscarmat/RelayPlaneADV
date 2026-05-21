@@ -6,14 +6,15 @@
  *
  * Guarantees:
  *  - Fires exactly once per install (flag written to ~/.relayplane/nudge-shown.json)
- *  - Prints to stderr — never pollutes proxy response stdout
- *  - Zero added latency — call checkAndShowNudge() *after* forwarding the response
- *  - Never throws — all errors are silently swallowed
+ *  - Prints to stderr, never pollutes proxy response stdout
+ *  - Zero added latency; call checkAndShowNudge() *after* forwarding the response
+ *  - Never throws; all errors are silently swallowed
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { getConfigDir } from './config.js';
+import { initiateClaimFlow } from './claim-flow.js';
 
 /** Path to the telemetry event log */
 function getTelemetryFile(): string {
@@ -39,7 +40,7 @@ export function initNudge(): void {
       nudgeAlreadyShown = true;
     }
   } catch {
-    // Silently ignore — nudge is non-critical
+    // Silently ignore; nudge is non-critical
   }
 }
 
@@ -96,16 +97,17 @@ function printNudge(count: number): void {
  * @param requestCount  Optional: pass the current cumulative count if you
  *                      already have it (avoids re-reading the file).  When
  *                      omitted the file is read on every call until the nudge
- *                      fires — fine because reads are O(lines) and infrequent.
+ *                      fires; fine because reads are O(lines) and infrequent.
  */
 export function checkAndShowNudge(requestCount?: number): void {
-  // Fast path — already shown, skip all I/O
+  // Fast path: already shown, skip all I/O
   if (nudgeAlreadyShown) return;
 
   try {
     const count = requestCount ?? countTelemetryRequests();
     if (count >= 100) {
       printNudge(count);
+      initiateClaimFlow().catch(() => {});
       markNudgeShown();
     }
   } catch {
