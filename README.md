@@ -80,6 +80,78 @@ RelayPlane will start automatically when Claude Code opens. If it's already runn
 
 **Anthropic** · **OpenAI** · **Google Gemini** · **xAI/Grok** · **OpenRouter** · **DeepSeek** · **Groq** · **Mistral** · **Together** · **Fireworks** · **Perplexity**
 
+## Custom Providers
+
+Add any OpenAI-compatible or Anthropic-compatible LLM provider via configuration — no code changes required. Define your providers in the `customProviders` array in `~/.relayplane/config.json`:
+
+```json
+{
+  "customProviders": [
+    {
+      "name": "azure-openai",
+      "baseUrl": "https://my-resource.openai.azure.com/openai/deployments/gpt-4",
+      "apiCompatibility": "openai",
+      "apiKeyEnvVar": "AZURE_OPENAI_KEY",
+      "headers": {
+        "api-version": "2024-02-01"
+      },
+      "models": [
+        "azure-gpt4",
+        { "name": "azure-gpt4-turbo", "remoteModel": "gpt-4-turbo" }
+      ],
+      "costPer1kInput": 0.01,
+      "costPer1kOutput": 0.03
+    },
+    {
+      "name": "custom-claude",
+      "baseUrl": "https://my-anthropic-proxy.internal/v1",
+      "apiCompatibility": "anthropic",
+      "apiKeyEnvVar": "CUSTOM_CLAUDE_KEY",
+      "apiKeyValue": "sk-direct-key-here",
+      "authHeader": "X-Custom-Auth",
+      "models": ["internal-claude"],
+      "modelPrefix": "internal/"
+    }
+  ]
+}
+```
+
+Custom providers integrate fully with all proxy features: circuit breaker, cascade fallback, cost tracking, rate limiting, cooldowns, and dashboard telemetry.
+
+### Custom Provider Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Unique identifier for the provider. If it matches a built-in provider name, the custom definition overrides the built-in. |
+| `baseUrl` | Yes | Base URL for API requests (e.g., `https://api.example.com/v1`). |
+| `apiCompatibility` | Yes | API format: `"openai"` or `"anthropic"`. Determines request/response format and default auth header. |
+| `apiKeyEnvVar` | Yes | Name of the environment variable containing the API key. |
+| `apiKeyValue` | No | Direct API key value. Takes priority over the environment variable when both are set. |
+| `headers` | No | Map of custom headers included in every request to this provider. |
+| `authHeader` | No | Custom authentication header name. Overrides the default (`Authorization` for OpenAI, `x-api-key` for Anthropic). |
+| `models` | No | Array of model definitions. Each entry is either a string (used as both local and remote name) or an object `{ "name": "local-name", "remoteModel": "upstream-name" }`. |
+| `modelPrefix` | No | Prefix-based routing. All model names starting with this prefix automatically route to this provider without explicit listing in `models`. |
+| `costPer1kInput` | No | Cost per 1,000 input tokens in USD. Used for cost estimation and budget tracking. Defaults to 0. |
+| `costPer1kOutput` | No | Cost per 1,000 output tokens in USD. Used for cost estimation and budget tracking. Defaults to 0. |
+
+### How It Works
+
+- **Format conversion** is automatic. If a request arrives in OpenAI format but targets an Anthropic-compatible provider (or vice versa), the proxy converts the request and response transparently.
+- **Authentication** uses `Authorization: Bearer <key>` for OpenAI-compatible providers and `x-api-key: <key>` for Anthropic-compatible providers by default. Override with `authHeader`.
+- **Model routing**: when a request specifies a model listed in a custom provider's `models` array (or matching its `modelPrefix`), the proxy routes to that provider.
+- **Streaming** (SSE) works for both compatibility types with per-chunk format conversion when needed.
+- **Validation** runs at startup. Invalid entries are skipped with clear error messages. Missing API keys produce a warning but don't prevent registration.
+
+### Hot Reload
+
+Add or remove custom providers without restarting the proxy:
+
+```bash
+curl -X POST http://localhost:4100/v1/admin/reload-providers
+```
+
+The response lists providers added, removed, and unchanged. In-flight requests to removed providers are allowed to complete.
+
 ## Configuration
 
 RelayPlane reads configuration from `~/.relayplane/config.json`. Override the path with the `RELAYPLANE_CONFIG_PATH` environment variable.
